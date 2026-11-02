@@ -1,0 +1,60 @@
+#!/bin/bash
+set -euo pipefail
+#
+# Print what the processes of a deploy-ipa console build uploaded: stdout, stderr, NSLog
+# and their own Logger lines, each prefixed by time and process name.
+#
+# Usage: deploy-ipa-console [--follow] <scheme | s3://bucket/prefix/>
+#   a scheme picks its newest console build; --follow keeps printing lines as they arrive
+#
+
+FOLLOW=0
+if [ "${1:-}" = "--follow" ]; then
+    FOLLOW=1
+    shift
+fi
+if [ $# -ne 1 ]; then
+    echo "Usage: $0 [--follow] <scheme | s3://bucket/prefix/>" >&2
+    exit 1
+fi
+
+ENV_FILE="${DEPLOY_IPA_ENV:-$HOME/.config/deploy-ipa.env}"
+if [ ! -f "$ENV_FILE" ]; then
+    echo "Error: $ENV_FILE is missing; run $(dirname "$0")/setup first" >&2
+    exit 1
+fi
+source "$ENV_FILE"
+: "${DEPLOY_IPA_PROFILE:?}" "${DEPLOY_IPA_BUCKET:?}" "${DEPLOY_IPA_PREFIX:?}"
+aws_() { aws --profile "$DEPLOY_IPA_PROFILE" "$@"; }
+export LC_ALL=C
+
+case "$1" in
+    s3://*)
+        PREFIX="${1%/}/"
+        ;;
+    *)
+        BASE="s3://$DEPLOY_IPA_BUCKET/$DEPLOY_IPA_PREFIX/${1// /-}/console/"
+        LATEST=$({ aws_ s3 ls "$BASE" || true; } | awk '$1 == "PRE" {print $2}' | sort | tail -n 1)
+        if [ -z "$LATEST" ]; then
+            echo "Error: no console builds under $BASE" >&2
+            exit 1
+        fi
+        PREFIX="$BASE$LATEST"
+        ;;
+esac
+BUCKET="${PREFIX#s3://}"
+BUCKET="${BUCKET%%/*}"
+echo "Console of $PREFIX"
+
+SEEN=$(mktemp)
+trap 'rm -f "$SEEN" "$SEEN.now"' EXIT
+while true; do
+    # keys sort by process launch, then by upload sequence within it
+    { aws_ s3 ls "$PREFIX" --recursive || true; } | awk '{print $4}' | sort > "$SEEN.now"
+    comm -13 "$SEEN" "$SEEN.now" | while read -r key; do
+        aws_ s3 cp "s3://$BUCKET/$key" - --only-show-errors
+    done
+    mv "$SEEN.now" "$SEEN"
+    [ "$FOLLOW" = 1 ] || break
+    sleep 3
+done

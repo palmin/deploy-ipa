@@ -1,0 +1,6 @@
+{
+  "name": "deploy-ipa",
+  "description": "Build a debug iOS app, upload it to your own S3 bucket and tap the install link Claude replies with on your phone, optionally with its console output uploaded for Claude to read",
+  "version": "1.0.0",
+  "author": { "name": "Anders Borum" }
+}

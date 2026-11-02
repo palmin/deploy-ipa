@@ -1,0 +1,32 @@
+#!/bin/bash
+set -euo pipefail
+#
+# Compile RemoteConsole.m into an object file that uploads console output under an S3 key
+# prefix, with the POST policy from upload-policy compiled in.
+#
+# Usage: build-console-object <iphoneos|iphonesimulator|macosx> <output.o> <key prefix>
+#
+# Link it into every target with an xcconfig passed to xcodebuild -xcconfig:
+#   OTHER_LDFLAGS[sdk=iphoneos*] = $(inherited) /path/to/output.o
+#
+
+if [ $# -ne 3 ]; then
+    echo "Usage: $0 <iphoneos|iphonesimulator|macosx> <output.o> <key prefix>" >&2
+    exit 1
+fi
+
+SDK="$1"
+OUTPUT="$2"
+PREFIX="$3"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+
+case "$SDK" in
+    iphoneos) TARGET=arm64-apple-ios15.0 ;;
+    iphonesimulator) TARGET=arm64-apple-ios15.0-simulator ;;
+    macosx) TARGET=arm64-apple-macos12.0 ;;
+    *) echo "Error: SDK must be iphoneos, iphonesimulator or macosx" >&2; exit 1 ;;
+esac
+
+CONFIG=$("$HERE/upload-policy" "$PREFIX")
+xcrun -sdk "$SDK" clang -target "$TARGET" -fobjc-arc -fmodules -fapplication-extension -Os \
+    -DREMOTE_CONSOLE_CONFIG="\"$CONFIG\"" -c "$HERE/RemoteConsole.m" -o "$OUTPUT"

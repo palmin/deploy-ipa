@@ -1,0 +1,11 @@
+{
+  "name": "deploy-ipa",
+  "owner": { "name": "Anders Borum" },
+  "plugins": [
+    {
+      "name": "deploy-ipa",
+      "source": "./",
+      "description": "Build a debug iOS app, upload it to your own S3 bucket and tap the install link Claude replies with on your phone, optionally with its console output uploaded for Claude to read"
+    }
+  ]
+}

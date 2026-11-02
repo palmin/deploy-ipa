@@ -1,0 +1,57 @@
+#!/bin/bash
+set -euo pipefail
+#
+# Print the base64 encoded upload config RemoteConsole.m is compiled with: an S3 POST policy
+# that allows uploads only under a key prefix, for as long as install links last.
+#
+# Usage: upload-policy <key prefix>
+#
+# The policy carries only a signature and the access key id; the secret key never leaves this Mac.
+#
+
+if [ $# -ne 1 ]; then
+    echo "Usage: $0 <key prefix>" >&2
+    exit 1
+fi
+
+ENV_FILE="${DEPLOY_IPA_ENV:-$HOME/.config/deploy-ipa.env}"
+if [ ! -f "$ENV_FILE" ]; then
+    echo "Error: $ENV_FILE is missing; run $(dirname "$0")/setup first" >&2
+    exit 1
+fi
+source "$ENV_FILE"
+: "${DEPLOY_IPA_PROFILE:?}" "${DEPLOY_IPA_BUCKET:?}" "${DEPLOY_IPA_EXPIRES:=604800}"
+
+export CREDENTIALS REGION BUCKET="$DEPLOY_IPA_BUCKET" PREFIX="$1" EXPIRES="$DEPLOY_IPA_EXPIRES"
+CREDENTIALS=$(aws --profile "$DEPLOY_IPA_PROFILE" configure export-credentials --format process)
+REGION=$(aws --profile "$DEPLOY_IPA_PROFILE" configure get region)
+python3 -I -c '
+import base64, datetime, hashlib, hmac, json, os
+
+credentials = json.loads(os.environ["CREDENTIALS"])
+region, bucket, prefix = os.environ["REGION"], os.environ["BUCKET"], os.environ["PREFIX"]
+now = datetime.datetime.now(datetime.timezone.utc)
+day = now.strftime("%Y%m%d")
+expiration = now + datetime.timedelta(seconds=int(os.environ["EXPIRES"]))
+access_key = credentials["AccessKeyId"]
+
+fields = {
+    "x-amz-algorithm": "AWS4-HMAC-SHA256",
+    "x-amz-credential": f"{access_key}/{day}/{region}/s3/aws4_request",
+    "x-amz-date": now.strftime("%Y%m%dT%H%M%SZ"),
+}
+if credentials.get("SessionToken"):
+    fields["x-amz-security-token"] = credentials["SessionToken"]
+conditions = [{"bucket": bucket}, ["starts-with", "$key", prefix], ["content-length-range", 0, 10485760]]
+conditions += [{name: value} for name, value in fields.items()]
+policy = {"expiration": expiration.strftime("%Y-%m-%dT%H:%M:%SZ"), "conditions": conditions}
+fields["policy"] = base64.b64encode(json.dumps(policy).encode()).decode()
+
+key = ("AWS4" + credentials["SecretAccessKey"]).encode()
+for part in (day, region, "s3", "aws4_request"):
+    key = hmac.new(key, part.encode(), hashlib.sha256).digest()
+fields["x-amz-signature"] = hmac.new(key, fields["policy"].encode(), hashlib.sha256).hexdigest()
+
+config = {"url": f"https://{bucket}.s3.{region}.amazonaws.com/", "prefix": prefix, "fields": fields}
+print(base64.b64encode(json.dumps(config).encode()).decode())
+'

@@ -1,0 +1,161 @@
+#!/bin/bash
+set -euo pipefail
+#
+# Archive an iOS scheme as a development-signed .ipa, upload it to S3 and print install links.
+#
+# Usage: deploy-ipa [--console] <scheme> [configuration]
+#   --console links RemoteConsole.m into every target, so the build uploads its console output
+#   configuration defaults to Debug
+#   run it from the folder holding the .xcworkspace or .xcodeproj, or set DEPLOY_IPA_XCODE
+#
+# Settings come from ~/.config/deploy-ipa.env (or DEPLOY_IPA_ENV), written by setup, and the
+# keys from the aws profile it names. The last lines printed are KEY=value: TITLE, VERSION,
+# BUILD, CONFIGURATION, EXPIRES, INSTALL_URL, PAGE_URL and with --console also CONSOLE, the
+# S3 prefix deploy-ipa-console reads.
+#
+
+CONSOLE=0
+if [ "${1:-}" = "--console" ]; then
+    CONSOLE=1
+    shift
+fi
+if [ $# -lt 1 ] || [ $# -gt 2 ]; then
+    echo "Usage: $0 [--console] <scheme> [configuration]" >&2
+    exit 1
+fi
+
+SCHEME="$1"
+NAME="${SCHEME// /-}"
+CONFIGURATION="${2:-Debug}"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+
+ENV_FILE="${DEPLOY_IPA_ENV:-$HOME/.config/deploy-ipa.env}"
+if [ ! -f "$ENV_FILE" ]; then
+    echo "Error: $ENV_FILE is missing; run $HERE/setup first" >&2
+    exit 1
+fi
+source "$ENV_FILE"
+: "${DEPLOY_IPA_PROFILE:?}" "${DEPLOY_IPA_BUCKET:?}" "${DEPLOY_IPA_PREFIX:?}" "${DEPLOY_IPA_EXPIRES:=604800}"
+
+aws_() { aws --profile "$DEPLOY_IPA_PROFILE" "$@"; }
+
+# a workspace wins over a project, as it usually wraps one
+XCODE="${DEPLOY_IPA_XCODE:-}"
+if [ -z "$XCODE" ]; then
+    shopt -s nullglob
+    workspaces=(*.xcworkspace)
+    projects=(*.xcodeproj)
+    shopt -u nullglob
+    if [ ${#workspaces[@]} -eq 1 ]; then
+        XCODE="${workspaces[0]}"
+    elif [ ${#workspaces[@]} -eq 0 ] && [ ${#projects[@]} -eq 1 ]; then
+        XCODE="${projects[0]}"
+    else
+        echo "Error: found ${#workspaces[@]} workspaces and ${#projects[@]} projects in $PWD, set DEPLOY_IPA_XCODE" >&2
+        exit 1
+    fi
+fi
+case "$XCODE" in
+    *.xcworkspace) XCODE_ARGS=(-workspace "$XCODE") ;;
+    *.xcodeproj) XCODE_ARGS=(-project "$XCODE") ;;
+    *) echo "Error: $XCODE is neither a workspace nor a project" >&2; exit 1 ;;
+esac
+
+# no double slash, since // starts a comment in the xcconfig a console build writes
+TEMPORARY="${TMPDIR:-/tmp}"
+WORK=$(mktemp -d "${TEMPORARY%/}/deploy-ipa.XXXXXX")
+trap 'rm -rf "$WORK"' EXIT
+ARCHIVE="$WORK/$SCHEME.xcarchive"
+
+# linked into every target, so extensions upload their console output too
+if [ "$CONSOLE" = 1 ]; then
+    CONSOLE_PREFIX="$DEPLOY_IPA_PREFIX/$NAME/console/$(date +%Y%m%d-%H%M%S)/"
+    echo "Linking RemoteConsole, uploading to $CONSOLE_PREFIX..."
+    "$HERE/build-console-object" iphoneos "$WORK/RemoteConsole.o" "$CONSOLE_PREFIX"
+    echo "OTHER_LDFLAGS[sdk=iphoneos*] = \$(inherited) $WORK/RemoteConsole.o" > "$WORK/console.xcconfig"
+    XCODE_ARGS+=(-xcconfig "$WORK/console.xcconfig")
+fi
+
+echo "Archiving $SCHEME ($CONFIGURATION) from $XCODE..."
+xcodebuild "${XCODE_ARGS[@]}" -scheme "$SCHEME" -configuration "$CONFIGURATION" \
+    -destination generic/platform=iOS -archivePath "$ARCHIVE" -allowProvisioningUpdates archive -quiet
+
+prop() { plutil -extract "ApplicationProperties.$1" raw "$ARCHIVE/Info.plist"; }
+BUNDLE_ID=$(prop CFBundleIdentifier)
+VERSION=$(prop CFBundleShortVersionString)
+BUILD=$(prop CFBundleVersion)
+APP="$ARCHIVE/Products/$(prop ApplicationPath)"
+TITLE=$(plutil -extract CFBundleDisplayName raw "$APP/Info.plist" 2>/dev/null || plutil -extract CFBundleName raw "$APP/Info.plist")
+
+# an archive signed with a device profile installs as is, and exporting it costs a minute of profile checks
+if security cms -D -i "$APP/embedded.mobileprovision" 2>/dev/null | grep -q '<key>ProvisionedDevices</key>'; then
+    echo "Packaging $TITLE $VERSION ($BUILD), already signed for devices..."
+    mkdir "$WORK/Payload"
+    ditto "$APP" "$WORK/Payload/$(basename "$APP")"
+    IPA="$WORK/app.ipa"
+    (cd "$WORK" && zip -q -r -y "$IPA" Payload)
+else
+    echo "Exporting $TITLE $VERSION ($BUILD) signed for development..."
+    jq -n --arg team "$(prop Team)" '{method: "debugging", signingStyle: "automatic", teamID: $team}' > "$WORK/ExportOptions.json"
+    plutil -convert xml1 -o "$WORK/ExportOptions.plist" "$WORK/ExportOptions.json"
+    xcodebuild -exportArchive -archivePath "$ARCHIVE" -exportPath "$WORK/export" \
+        -exportOptionsPlist "$WORK/ExportOptions.plist" -allowProvisioningUpdates -quiet
+    IPA=$(find "$WORK/export" -maxdepth 1 -name '*.ipa' | head -n 1)
+    if [ -z "$IPA" ]; then
+        echo "Error: the export produced no .ipa" >&2
+        exit 1
+    fi
+fi
+
+FOLDER="s3://$DEPLOY_IPA_BUCKET/$DEPLOY_IPA_PREFIX/$NAME/$VERSION-$BUILD-$(date +%Y%m%d-%H%M%S)"
+
+echo "Uploading $(du -h "$IPA" | cut -f1 | tr -d ' ') to $FOLDER..."
+aws_ s3 cp "$IPA" "$FOLDER/$NAME.ipa" --content-type application/octet-stream --only-show-errors
+IPA_URL=$(aws_ s3 presign "$FOLDER/$NAME.ipa" --expires-in "$DEPLOY_IPA_EXPIRES")
+
+# iOS installs only through a manifest fetched over https that points at the .ipa
+jq -n --arg url "$IPA_URL" --arg id "$BUNDLE_ID" --arg version "$VERSION" --arg title "$TITLE" \
+    '{items: [{assets: [{kind: "software-package", url: $url}],
+               metadata: {"bundle-identifier": $id, "bundle-version": $version, kind: "software", title: $title}}]}' \
+    > "$WORK/manifest.json"
+plutil -convert xml1 -o "$WORK/manifest.plist" "$WORK/manifest.json"
+aws_ s3 cp "$WORK/manifest.plist" "$FOLDER/manifest.plist" --content-type application/xml --only-show-errors
+MANIFEST_URL=$(aws_ s3 presign "$FOLDER/manifest.plist" --expires-in "$DEPLOY_IPA_EXPIRES")
+ENCODED=$(jq -rn --arg u "$MANIFEST_URL" '$u | @uri')
+INSTALL_URL="itms-services://?action=download-manifest&url=$ENCODED"
+
+# an https page with the same link, which Safari keeps around for retrying
+HTML_TITLE=$(jq -rn --arg t "$TITLE" '$t | @html')
+printf '%s\n' \
+    '<!doctype html><html><head><meta charset="utf-8">' \
+    '<meta name="viewport" content="width=device-width, initial-scale=1">' \
+    "<title>Install $HTML_TITLE</title>" \
+    '<style>body{font:17px -apple-system,sans-serif;text-align:center;padding:3em 1em}' \
+    'a{display:inline-block;padding:.8em 2em;border-radius:12px;background:#007aff;color:#fff;text-decoration:none}</style>' \
+    "</head><body><h1>$HTML_TITLE</h1><p>$VERSION ($BUILD), $CONFIGURATION</p>" \
+    "<p><a href=\"itms-services://?action=download-manifest&amp;url=$ENCODED\">Install</a></p></body></html>" \
+    > "$WORK/index.html"
+aws_ s3 cp "$WORK/index.html" "$FOLDER/index.html" --content-type "text/html; charset=utf-8" --only-show-errors
+PAGE_URL=$(aws_ s3 presign "$FOLDER/index.html" --expires-in "$DEPLOY_IPA_EXPIRES")
+
+# builds whose links have expired are useless, so drop them
+CUTOFF=$(date -v-"${DEPLOY_IPA_EXPIRES}"S '+%Y-%m-%d %H:%M:%S')
+{ aws_ s3 ls "s3://$DEPLOY_IPA_BUCKET/$DEPLOY_IPA_PREFIX/" --recursive || true; } |
+while read -r day clock size key; do
+    if [[ "$day $clock" < "$CUTOFF" ]]; then
+        aws_ s3 rm "s3://$DEPLOY_IPA_BUCKET/$key" --only-show-errors || true
+    fi
+done
+
+echo "Done in ${SECONDS}s"
+echo
+echo "TITLE=$TITLE"
+echo "VERSION=$VERSION"
+echo "BUILD=$BUILD"
+echo "CONFIGURATION=$CONFIGURATION"
+echo "EXPIRES=$(date -v+"${DEPLOY_IPA_EXPIRES}"S '+%Y-%m-%d %H:%M')"
+echo "INSTALL_URL=$INSTALL_URL"
+echo "PAGE_URL=$PAGE_URL"
+if [ "$CONSOLE" = 1 ]; then
+    echo "CONSOLE=s3://$DEPLOY_IPA_BUCKET/$CONSOLE_PREFIX"
+fi
