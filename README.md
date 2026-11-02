@@ -117,3 +117,10 @@ temporary debug lines as `NSLog` or `print`.
 | `skills/deploy-ipa/aws-credentials` | reads the AWS keys from the Keychain for the `aws` CLI |
 | `skills/deploy-ipa/setup` | sets everything up and checks it |
 | `iam-policy.json` | the permissions the IAM user needs |
+
+## About me
+
+I'm [Anders Borum](https://mastodon.social/@palmin), making developer
+tools for iOS and Mac, most notably [Working Copy](https://workingcopy.app),
+the full-featured Git client for iOS putting your
+side-projects in your side pocket where they belong.
